@@ -1,118 +1,75 @@
-#include <arpa/inet.h>
+#include "../include/client.h"
+#include "../include/networking.h"
+#include <asm-generic/errno-base.h>
+#include <asm-generic/errno.h>
 #include <errno.h>
 #include <netinet/in.h>
-#include <netinet/ip.h>
-#include <pthread.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
+#include <threads.h>
 #include <unistd.h>
 
-void *handle_client(void *arg) {
-  printf("Thread spawned!\n");
-  int client_fd = *(int *)arg;
-  free(arg);
-  while (1) {
-    // Read from the client
-    char client_msg[1024];
-
-    int x = recv(client_fd, client_msg, sizeof(client_msg), 0);
-    if (x < 0) {
-      perror("recv : ");
-      break;
-    } else if (x == 0) {
-      // The client disconnected gracefully
-      printf("Client disconnected gracefully\n");
-      break;
-    } else {
-      // Send the response back
-      char *msg = "+PONG\r\n";
-      send(client_fd, msg, strlen(msg), 0);
-    }
-  }
-  close(client_fd);
-  return NULL;
-}
+#define MAX_EVENTS 64
 
 int main() {
+
+  /**
+   * Event loop implementation using epoll
+   */
+
   // Disable output buffering
   setbuf(stdout, NULL);
   setbuf(stderr, NULL);
 
-  // You can use print statements as follows for debugging, they'll be visible
-  // when running tests.
-  printf("Logs from your program will appear here!\n");
+  // Set up a non-blocking socket
+  int sfd = setup_server_socket(6379);
 
-  int server_fd;
-  socklen_t client_addr_len;
-  struct sockaddr_in client_addr;
+  printf("socket setup with fd %d\n", sfd);
 
-  server_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (server_fd == -1) {
-    printf("Socket creation failed: %s...\n", strerror(errno));
-    return 1;
+  // Initialize Epoll instance
+  int epfd = epoll_create1(0);
+  if (epfd < 0) {
+    perror("epoll_create1: ");
+    return -1;
   }
 
-  // Since the tester restarts your program quite often, setting SO_REUSEADDR
-  // ensures that we don't run into 'Address already in use' errors
-  int reuse = 1;
-  if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) <
-      0) {
-    printf("SO_REUSEADDR failed: %s \n", strerror(errno));
-    return 1;
+  // Register server socket with Epoll
+  if (add_to_epoll(epfd, sfd) != 0) {
+    perror("epoll_ctl: ");
+    return -1;
   }
 
-  struct sockaddr_in serv_addr = {
-      .sin_family = AF_INET,
-      .sin_port = htons(6379),
-      .sin_addr = {htonl(INADDR_ANY)},
-  };
+  struct epoll_event events[MAX_EVENTS];
 
-  if (bind(server_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) != 0) {
-    printf("Bind failed: %s \n", strerror(errno));
-    return 1;
-  }
-
-  int connection_backlog = 5;
-  if (listen(server_fd, connection_backlog) != 0) {
-    printf("Listen failed: %s \n", strerror(errno));
-    return 1;
-  }
-
-  printf("Waiting for a client to connect...\n");
-  client_addr_len = sizeof(client_addr);
-
+  // Event loop to handle epoll events
   while (1) {
-    int client_fd =
-        accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
-    if (client_fd < 0) {
-      perror("accept : ");
-      continue;
-    } else {
-      char *client_ip = inet_ntoa(client_addr.sin_addr);
-      int client_port = ntohs(client_addr.sin_port);
-      printf("Client connected from %s : %d\n", client_ip, client_port);
+    int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
+    for (int i = 0; i < n; i++) {
+      if (events[i].data.fd == sfd) {
+        // EPOLLIN event triggered on server fd
+        // i.e new client
+        int cfd = accept_and_register_client(epfd, sfd);
+        if (cfd < 0) {
+          int err = -cfd;
 
-      // Place a copy of client fd on heap
-      int *client_heap_fd = malloc(sizeof(int));
-      *client_heap_fd = client_fd;
+          if (err == EAGAIN || err == EWOULDBLOCK) {
+            // This is expected for non-blocking
+            continue;
+          } else {
+            fprintf(stderr, "New client failed to register: %s\n",
+                    strerror(err));
+            continue;
+          }
+        }
 
-      // Spawn a thread to serve a client
-      pthread_t thread_id;
-      if (pthread_create(&thread_id, NULL, handle_client,
-                         (void *)client_heap_fd) != 0) {
-        perror("Failed to create a thread!");
-        free(client_heap_fd);
-        continue;
+      } else {
+        if (serve_client(events[i].data.fd) < 0) {
+          close(events[i].data.fd); // closing fd auto removes from epoll
+        }
       }
-
-      // Detach so OS can auto clean up thread
-      pthread_detach(thread_id);
     }
   }
-
-  close(server_fd);
-
   return 0;
 }
